@@ -221,14 +221,17 @@ class EngineClient(ABC):
         beam_width = params.beam_width
         max_tokens = params.max_tokens
         length_penalty = params.length_penalty
+        temperature = params.temperature
 
         # Create sampling parameters that will give us multiple candidates
-        # We use a higher temperature and top-k to get diverse outputs
+        # Use temperature from params, but ensure some minimum for diversity if it's 0
+        effective_temperature = max(temperature, 0.1) if temperature == 0.0 else temperature
+        
         sampling_params = SamplingParams(
             n=beam_width,  # Generate multiple outputs
             max_tokens=max_tokens,
-            temperature=0.8,  # Slightly higher temperature for diversity
-            top_k=50,  # Consider top 50 tokens
+            temperature=effective_temperature,  # Use parameter temperature with minimum for diversity
+            top_k=50,  # Consider top 50 tokens for diversity
             logprobs=1,  # Get logprobs for scoring
             best_of=beam_width * 2,  # Generate more candidates than needed
         )

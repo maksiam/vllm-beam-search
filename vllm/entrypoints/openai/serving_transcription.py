@@ -353,6 +353,12 @@ class OpenAIServingTranscription(OpenAIServing):
                 return self.create_error_response(
                     "Empty output from model. Please check your parameters.")
             
+            # Debug: Log all beam search candidates
+            if request.use_beam_search and len(result.outputs) > 1:
+                logger.info(f"Beam search generated {len(result.outputs)} candidates:")
+                for i, output in enumerate(result.outputs):
+                    logger.info(f"  Candidate {i+1}: '{output.text}' (logprob: {output.cumulative_logprob})")
+            
             return TranscriptionResponse(text=result.outputs[0].text)
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")

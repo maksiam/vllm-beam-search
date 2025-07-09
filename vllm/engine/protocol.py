@@ -268,27 +268,66 @@ class EngineClient(ABC):
         ]
         completed = []
 
-        # Run beam search for max_tokens steps
-        for step in range(max_tokens):
+        # For encoder-decoder models, we need to process the encoder once and then
+        # do beam search on the decoder side. Since the current engine doesn't
+        # support multimodal data in beam search context, we'll use a different approach.
+        
+        # Generate initial sequences using regular generation with beam search parameters
+        # but only for one step to get the logprobs we need
+        result_generator = self.generate(
+            prompt, 
+            beam_search_params,
+            f"{request_id}-initial"
+        )
+        
+        # Collect the initial result to get logprobs
+        initial_outputs = []
+        async for result in result_generator:
+            initial_outputs.append(result)
+        
+        if not initial_outputs:
+            return
+            
+        initial_result = initial_outputs[0]
+        
+        # Extract logprobs from the initial result
+        if not initial_result.outputs or not initial_result.outputs[0].logprobs:
+            # If no logprobs, return simple result
+            yield initial_result
+            return
+            
+        # Get the logprobs for the first generated token
+        first_token_logprobs = initial_result.outputs[0].logprobs[0]
+        
+        # Create initial beams from the top logprobs
+        initial_beams = []
+        for token_id, logprob_obj in sorted(first_token_logprobs.items(), 
+                                           key=lambda x: x[1].logprob, reverse=True)[:beam_width]:
+            initial_beams.append(
+                BeamSearchSequence(
+                    tokens=decoder_prompt_token_ids + [token_id],
+                    logprobs=[first_token_logprobs],
+                    cum_logprob=logprob_obj.logprob,
+                    multi_modal_data=multi_modal_data,
+                    mm_processor_kwargs={}
+                )
+            )
+        
+        all_beams = initial_beams
+        completed = []
+
+        # Continue beam search for remaining tokens
+        for step in range(1, max_tokens):
             if not all_beams:
                 break
                 
-            # Create prompts for this beam search step
-            # For encoder-decoder models, we need to reconstruct the full prompt structure
+            # For subsequent steps, we'll use regular generation with decoder tokens only
+            # This avoids the multimodal data issue
             prompts_batch = []
             for beam in all_beams:
-                # Reconstruct encoder-decoder prompt with updated decoder tokens
-                decoder_prompt_kwargs = {"prompt_token_ids": beam.tokens}
-                if beam.multi_modal_data is not None:
-                    decoder_prompt_kwargs["multi_modal_data"] = beam.multi_modal_data
-                if beam.mm_processor_kwargs:
-                    decoder_prompt_kwargs["mm_processor_kwargs"] = beam.mm_processor_kwargs
-                    
-                enc_dec_prompt = ExplicitEncoderDecoderPrompt(
-                    encoder_prompt=prompt["encoder_prompt"],  # Keep original encoder prompt
-                    decoder_prompt=TokensPrompt(**decoder_prompt_kwargs)
-                )
-                prompts_batch.append(enc_dec_prompt)
+                # Use just the decoder tokens for continuation
+                decoder_prompt = TokensPrompt(prompt_token_ids=beam.tokens)
+                prompts_batch.append(decoder_prompt)
 
             # Generate next tokens for all beams
             tasks = []

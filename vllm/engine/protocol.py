@@ -7,7 +7,7 @@ from typing import AsyncGenerator, List, Mapping, Optional
 from vllm.beam_search import BeamSearchSequence, create_sort_beams_key_function
 from vllm.config import DecodingConfig, ModelConfig, VllmConfig
 from vllm.core.scheduler import SchedulerOutputs
-from vllm.inputs.data import PromptType, TokensPrompt
+from vllm.inputs.data import PromptType, TokensPrompt, ExplicitEncoderDecoderPrompt
 from vllm.inputs.parse import is_explicit_encoder_decoder_prompt
 from vllm.inputs.preprocess import InputPreprocessor
 from vllm.logger import init_logger
@@ -226,20 +226,23 @@ class EngineClient(ABC):
         length_penalty = params.length_penalty
         include_stop_str_in_output = params.include_stop_str_in_output
 
-        # Process the encoder-decoder prompt
-        processed_inputs = preprocessor._prompt_to_llm_inputs(prompt)
+        # Process the encoder-decoder prompt using the correct method
+        processed_inputs = preprocessor._process_encoder_decoder_prompt(prompt)
         
         # For encoder-decoder models, processed_inputs contains both encoder and decoder info
-        encoder_inputs = processed_inputs.get("encoder", {})
-        decoder_inputs = processed_inputs.get("decoder", {})
+        encoder_inputs = processed_inputs["encoder"]
+        decoder_inputs = processed_inputs["decoder"]
         
         # Get the initial decoder prompt tokens
-        decoder_prompt_token_ids = decoder_inputs.get("prompt_token_ids", [])
+        decoder_prompt_token_ids = decoder_inputs["prompt_token_ids"]
         prompt_text = decoder_inputs.get("prompt", "")
         
         # Get multimodal data (for models like Whisper with audio input)
-        multi_modal_data = encoder_inputs.get("multi_modal_data") or decoder_inputs.get("multi_modal_data")
-        mm_processor_kwargs = encoder_inputs.get("mm_processor_kwargs") or decoder_inputs.get("mm_processor_kwargs")
+        multi_modal_data = None
+        if encoder_inputs["type"] == "multimodal":
+            multi_modal_data = encoder_inputs.get("mm_kwargs")
+        elif decoder_inputs["type"] == "multimodal":
+            multi_modal_data = decoder_inputs.get("mm_kwargs")
 
         tokenized_length = len(decoder_prompt_token_ids)
 
@@ -260,7 +263,7 @@ class EngineClient(ABC):
                 cum_logprob=0,
                 logprobs=[],
                 multi_modal_data=multi_modal_data,
-                mm_processor_kwargs=mm_processor_kwargs
+                mm_processor_kwargs={}
             )
         ]
         completed = []
@@ -275,14 +278,16 @@ class EngineClient(ABC):
             prompts_batch = []
             for beam in all_beams:
                 # Reconstruct encoder-decoder prompt with updated decoder tokens
-                enc_dec_prompt = {
-                    "encoder_prompt": prompt["encoder_prompt"],  # Keep original encoder prompt
-                    "decoder_prompt": TokensPrompt(
-                        prompt_token_ids=beam.tokens,
-                        multi_modal_data=beam.multi_modal_data,
-                        mm_processor_kwargs=beam.mm_processor_kwargs
-                    )
-                }
+                decoder_prompt_kwargs = {"prompt_token_ids": beam.tokens}
+                if beam.multi_modal_data is not None:
+                    decoder_prompt_kwargs["multi_modal_data"] = beam.multi_modal_data
+                if beam.mm_processor_kwargs:
+                    decoder_prompt_kwargs["mm_processor_kwargs"] = beam.mm_processor_kwargs
+                    
+                enc_dec_prompt = ExplicitEncoderDecoderPrompt(
+                    encoder_prompt=prompt["encoder_prompt"],  # Keep original encoder prompt
+                    decoder_prompt=TokensPrompt(**decoder_prompt_kwargs)
+                )
                 prompts_batch.append(enc_dec_prompt)
 
             # Generate next tokens for all beams

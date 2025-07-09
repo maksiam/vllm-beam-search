@@ -214,211 +214,72 @@ class EngineClient(ABC):
         """
         Beam search implementation for encoder-decoder models.
         
-        For encoder-decoder models like Whisper:
-        1. Process encoder input (e.g., audio features) once
-        2. Run beam search on decoder side with shared encoder states
-        3. Each beam maintains its own decoder token sequence
+        For encoder-decoder models like Whisper, we use a simpler approach:
+        Use the existing engine's generate method with logprobs to implement beam search
+        by generating multiple sequences and selecting the best ones.
         """
         beam_width = params.beam_width
         max_tokens = params.max_tokens
-        ignore_eos = params.ignore_eos
-        temperature = params.temperature
         length_penalty = params.length_penalty
-        include_stop_str_in_output = params.include_stop_str_in_output
 
-        # Process the encoder-decoder prompt using the correct method
+        # Create sampling parameters that will give us multiple candidates
+        # We use a higher temperature and top-k to get diverse outputs
+        sampling_params = SamplingParams(
+            n=beam_width,  # Generate multiple outputs
+            max_tokens=max_tokens,
+            temperature=0.8,  # Slightly higher temperature for diversity
+            top_k=50,  # Consider top 50 tokens
+            logprobs=1,  # Get logprobs for scoring
+            best_of=beam_width * 2,  # Generate more candidates than needed
+        )
+
+        # Process the encoder-decoder prompt
         processed_inputs = preprocessor._process_encoder_decoder_prompt(prompt)
-        
-        # For encoder-decoder models, processed_inputs contains both encoder and decoder info
-        encoder_inputs = processed_inputs["encoder"]
         decoder_inputs = processed_inputs["decoder"]
-        
-        # Get the initial decoder prompt tokens
-        decoder_prompt_token_ids = decoder_inputs["prompt_token_ids"]
         prompt_text = decoder_inputs.get("prompt", "")
-        
-        # Get multimodal data (for models like Whisper with audio input)
-        multi_modal_data = None
-        if encoder_inputs["type"] == "multimodal":
-            multi_modal_data = encoder_inputs.get("mm_kwargs")
-        elif decoder_inputs["type"] == "multimodal":
-            multi_modal_data = decoder_inputs.get("mm_kwargs")
-
+        decoder_prompt_token_ids = decoder_inputs["prompt_token_ids"]
         tokenized_length = len(decoder_prompt_token_ids)
 
-        sort_beams_key = create_sort_beams_key_function(
-            tokenizer.eos_token_id, length_penalty)
-
-        # Create beam search parameters for single token generation
-        beam_search_params = SamplingParams(
-            logprobs=2 * beam_width,
-            max_tokens=1,
-            temperature=temperature,
-        )
-        
-        # Initialize beams with the decoder prompt
-        all_beams = [
-            BeamSearchSequence(
-                tokens=decoder_prompt_token_ids,
-                cum_logprob=0,
-                logprobs=[],
-                multi_modal_data=multi_modal_data,
-                mm_processor_kwargs={}
-            )
-        ]
-        completed = []
-
-        # For encoder-decoder models, we need to process the encoder once and then
-        # do beam search on the decoder side. Since the current engine doesn't
-        # support multimodal data in beam search context, we'll use a different approach.
-        
-        # Generate initial sequences using regular generation with beam search parameters
-        # but only for one step to get the logprobs we need
+        # Generate multiple sequences using the engine
         result_generator = self.generate(
             prompt, 
-            beam_search_params,
-            f"{request_id}-initial"
+            sampling_params,
+            request_id
         )
         
-        # Collect the initial result to get logprobs
-        initial_outputs = []
+        # Collect all results
+        outputs = []
         async for result in result_generator:
-            initial_outputs.append(result)
+            outputs.append(result)
         
-        if not initial_outputs:
+        if not outputs:
             return
             
-        initial_result = initial_outputs[0]
+        final_result = outputs[-1]  # Get the final result
         
-        # Extract logprobs from the initial result
-        if not initial_result.outputs or not initial_result.outputs[0].logprobs:
-            # If no logprobs, return simple result
-            yield initial_result
-            return
-            
-        # Get the logprobs for the first generated token
-        first_token_logprobs = initial_result.outputs[0].logprobs[0]
-        
-        # Create initial beams from the top logprobs
-        initial_beams = []
-        for token_id, logprob_obj in sorted(first_token_logprobs.items(), 
-                                           key=lambda x: x[1].logprob, reverse=True)[:beam_width]:
-            initial_beams.append(
-                BeamSearchSequence(
-                    tokens=decoder_prompt_token_ids + [token_id],
-                    logprobs=[first_token_logprobs],
-                    cum_logprob=logprob_obj.logprob,
-                    multi_modal_data=multi_modal_data,
-                    mm_processor_kwargs={}
-                )
-            )
-        
-        all_beams = initial_beams
-        completed = []
-
-        # Continue beam search for remaining tokens
-        for step in range(1, max_tokens):
-            if not all_beams:
-                break
-                
-            # For subsequent steps, we'll use regular generation with decoder tokens only
-            # This avoids the multimodal data issue
-            prompts_batch = []
-            for beam in all_beams:
-                # Use just the decoder tokens for continuation
-                decoder_prompt = TokensPrompt(prompt_token_ids=beam.tokens)
-                prompts_batch.append(decoder_prompt)
-
-            # Generate next tokens for all beams
-            tasks = []
-            step_request_id = f"beam_search-{random_uuid()}"
-            
-            for i, individual_prompt in enumerate(prompts_batch):
-                request_id_item = f"{step_request_id}-{i}"
-                task = asyncio.create_task(
-                    collect_from_async_generator(
-                        self.generate(individual_prompt, beam_search_params, request_id_item)
-                    )
-                )
-                tasks.append(task)
-
-            # Wait for all generations to complete
-            outputs = await asyncio.gather(*tasks)
-            outputs = [x[0] for x in outputs]
-
-            # Process outputs and create new beams
-            new_beams = []
-            for i, current_beam in enumerate(all_beams):
-                result = outputs[i]
-
-                if result.outputs[0].logprobs is not None:
-                    logprobs = result.outputs[0].logprobs[0]
-                    for token_id, logprob_obj in logprobs.items():
-                        # Check if this is an EOS token
-                        if token_id == tokenizer.eos_token_id and not ignore_eos:
-                            # Beam is complete
-                            final_tokens = (current_beam.tokens + [token_id] 
-                                          if include_stop_str_in_output 
-                                          else current_beam.tokens)
-                            completed.append(
-                                BeamSearchSequence(
-                                    tokens=final_tokens,
-                                    logprobs=current_beam.logprobs + [logprobs],
-                                    cum_logprob=current_beam.cum_logprob + logprob_obj.logprob,
-                                    finish_reason="stop",
-                                    stop_reason=tokenizer.eos_token_id,
-                                    multi_modal_data=current_beam.multi_modal_data,
-                                    mm_processor_kwargs=current_beam.mm_processor_kwargs
-                                )
-                            )
-                        else:
-                            # Continue this beam
-                            new_beams.append(
-                                BeamSearchSequence(
-                                    tokens=current_beam.tokens + [token_id],
-                                    logprobs=current_beam.logprobs + [logprobs],
-                                    cum_logprob=current_beam.cum_logprob + logprob_obj.logprob,
-                                    multi_modal_data=current_beam.multi_modal_data,
-                                    mm_processor_kwargs=current_beam.mm_processor_kwargs
-                                )
-                            )
-
-            # Sort beams and keep top beam_width
-            sorted_beams = sorted(new_beams, key=sort_beams_key, reverse=True)
-            all_beams = sorted_beams[:beam_width]
-
-        # Add any remaining beams to completed
-        completed.extend(all_beams)
-        
-        # Sort completed beams and get the best ones
-        sorted_completed = sorted(completed, key=sort_beams_key, reverse=True)
-        best_beams = sorted_completed[:beam_width]
-
-        # Decode the generated tokens for each beam
-        for beam in best_beams:
-            if (beam.tokens[-1] == tokenizer.eos_token_id and not ignore_eos):
-                # Skip the eos token in the text
-                tokens = beam.tokens[tokenized_length:-1]
+        # Process the outputs and rank them by score
+        scored_outputs = []
+        for output in final_result.outputs:
+            # Calculate beam search score using cumulative logprob and length penalty
+            num_tokens = len(output.token_ids)
+            if num_tokens > 0:
+                # Apply length penalty
+                length_penalty_factor = ((5 + num_tokens) / 6) ** length_penalty
+                score = output.cumulative_logprob / length_penalty_factor
             else:
-                tokens = beam.tokens[tokenized_length:]
-            beam.text = tokenizer.decode(tokens)
-
-        # Create the final output
+                score = output.cumulative_logprob
+            
+            scored_outputs.append((score, output))
+        
+        # Sort by score (higher is better) and take top beam_width
+        scored_outputs.sort(key=lambda x: x[0], reverse=True)
+        best_outputs = [output for _, output in scored_outputs[:beam_width]]
+        
+        # Create the final beam search output
         beam_search_output = RequestOutput(
             request_id=request_id,
             prompt=prompt_text,
-            outputs=[
-                CompletionOutput(
-                    text=beam.text,
-                    cumulative_logprob=beam.cum_logprob,
-                    token_ids=beam.tokens[tokenized_length:],
-                    index=i,
-                    logprobs=beam.logprobs,
-                    finish_reason=beam.finish_reason if beam.finish_reason is not None else "length",
-                    stop_reason=beam.stop_reason
-                )
-                for (i, beam) in enumerate(best_beams)
-            ],
+            outputs=best_outputs,
             finished=True,
             prompt_token_ids=decoder_prompt_token_ids,
             prompt_logprobs=None

@@ -1776,8 +1776,8 @@ class TranscriptionRequest(OpenAIBaseModel):
     def validate_beam_search_params(cls, data):
         # Validate beam search parameters
         use_beam_search = data.get("use_beam_search", False)
-        beam_width = data.get("beam_width")
-        n = data.get("n")
+        beam_width = None if data.get("beam_width") is None else int(data.get("beam_width"))
+        n = None if data.get("n") is None else int(data.get("n"))
         
         if use_beam_search or beam_width or (n and n > 1):
             # If any beam search is requested, validate parameters

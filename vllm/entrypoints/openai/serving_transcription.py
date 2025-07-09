@@ -310,8 +310,6 @@ class OpenAIServingTranscription(OpenAIServing):
                 prompt_adapter_request=None)
 
             if request.use_beam_search:
-                logger.info(f"Starting beam search with params: {sampling_params}")
-                logger.info(f"Prompt keys: {prompt.keys() if isinstance(prompt, dict) else type(prompt)}")
                 result_generator = self.engine_client.beam_search(
                     prompt=prompt,
                     request_id=request_id,
@@ -343,31 +341,23 @@ class OpenAIServingTranscription(OpenAIServing):
         try:
             assert result_generator is not None
             result = None
-            result_count = 0
-            logger.info("Starting result generation loop...")
             async for op in result_generator:
-                result_count += 1
                 result = op
-                logger.info(f"Received result {result_count}: {type(result)}, outputs: {len(result.outputs) if result and result.outputs else 'None'}")
-            
-            logger.info(f"Finished result generation loop. Total results: {result_count}")
             
             if result is None:
                 return self.create_error_response(
-                    "No results generated from beam search. "
+                    "No results generated from generation request. "
                     "Please check your model configuration and parameters.")
             
             if not result.outputs or len(result.outputs) == 0:
                 return self.create_error_response(
-                    "Empty output from model. Please check your beam search parameters.")
+                    "Empty output from model. Please check your parameters.")
             
-            logger.info(f"Returning transcription with text length: {len(result.outputs[0].text)}")
             return TranscriptionResponse(text=result.outputs[0].text)
         except asyncio.CancelledError:
             return self.create_error_response("Client disconnected")
         except (ValueError, NameError, AttributeError, IndexError) as e:
             # TODO: Use a vllm-specific Validation Error
-            logger.exception("Error during transcription processing")
             return self.create_error_response(str(e))
         except Exception as e:
             # Catch any other unexpected errors
